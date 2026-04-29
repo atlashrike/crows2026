@@ -1,0 +1,2383 @@
+import csv
+import os
+
+run_to_library = {}
+if os.path.exists("library_info.tsv"):
+    with open("library_info.tsv", newline="") as f:
+        rdr = csv.DictReader(f, delimiter="\t")
+        for row in rdr:
+            run = (row.get("run") or "").strip()
+            lib = (row.get("library_name") or "").strip()
+            if run and lib:
+                run_to_library[run] = lib
+
+def rglb_for(run_id: str) -> str:
+    return run_to_library.get(run_id, sra_to_individual[run_id])
+
+from sra_data import sra_data
+
+INDIVIDUALS = list(sra_data.keys())
+TRIM5_INDIVIDUALS = {"CHN_Gu_P01", "Un_un_P02"}
+SRA_IDS = [sra_id for individual in sra_data.values() for sra_id in individual]
+
+# create reverse mapping: sra_id -> individual
+sra_to_individual = {}
+for individual, sra_ids in sra_data.items():
+    for sra_id in sra_ids:
+        sra_to_individual[sra_id] = individual
+
+# reference genome 
+REF_GENOME = "reference/GCF_000738735.6_ASM73873v6_genomic.fna"
+REF_URL = "https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/738/735/GCF_000738735.6_ASM73873v6/GCF_000738735.6_ASM73873v6_genomic.fna.gz"
+
+chrom_path = "reference/contigs.list"  
+CHROM = []
+
+from outgroup_data import outgroup_data
+from species_samples import species_samples
+
+OUTGROUP_INDIVIDUALS = list(outgroup_data.keys())
+OUTGROUP_IDS = [oid for ind in outgroup_data.values() for oid in ind]
+
+# reverse mapping for outgroups
+outgroup_to_individual = {}
+for individual, outgroup_ids in outgroup_data.items():
+    for oid in outgroup_ids:
+        outgroup_to_individual[oid] = individual
+
+SPECIES_INDIVIDUAL_PAIRS = [
+    (species, ind) 
+    for species, inds in species_samples.items() 
+    for ind in inds
+]
+
+with open(chrom_path, 'r') as file:
+    for line in file:
+        CHROM.append(line.strip()) 
+
+# additional reference files
+REPEAT_BED = "reference/GCF_000738735.6_ASM73873v6_genomic_repeats.bed"
+CHR_HAPLOID = "chrHaploid.scaffolds.list"
+CHR_DIPLOID = "chrDiploid.scaffolds.list"
+with open(CHR_DIPLOID) as f:
+    DIPLOID_CHROMS = [l.strip() for l in f if l.strip()]
+SKIP_CHROMS = {"NW_024108691.1", "NW_024108680.1"}
+SKIP_CHROMS2 = {"NW_024108681.1", "NW_024108690.1", "NW_024108691.1", "NW_024108686.1", "NW_024108680.1", "NW_024108694.1", "NW_024108693.1", "NW_024108692.1", "NW_024108689.1"}
+PHASE_CHROMS = [c for c in DIPLOID_CHROMS if c not in SKIP_CHROMS]
+LD_PHASE_CHROMS = [c for c in DIPLOID_CHROMS if c not in SKIP_CHROMS2]
+
+POPLIST = "poplist_134.txt"
+
+# Chromosome 18 to exclude from HWE filtering
+CHR18_EXCLUDE = ["NC_046347.1"]
+wildcard_constraints:
+    species = "|".join(species_samples.keys()),
+    individual = "|".join(OUTGROUP_INDIVIDUALS),
+    chrom = "|".join(PHASE_CHROMS)
+
+rule all:
+    input:
+        expand("07_estsfs/{chrom}/estsfs_input.txt", chrom=PHASE_CHROMS),
+
+
+rule download_sra:
+    output:
+        "sra/{sra_id}.sra"
+    params:
+        sra_id = lambda wildcards: wildcards.sra_id
+    shell:
+        """
+        prefetch {params.sra_id} --output-file {output}
+        """
+
+rule convert_to_fastq:
+    input:
+        "sra/{sra_id}.sra"
+    output:
+        r1 = "fastq/{sra_id}_1.fastq.gz",
+        r2 = "fastq/{sra_id}_2.fastq.gz"
+    threads: 16
+    shell:
+        """
+        fasterq-dump {input} --split-files -e {threads} -p --outdir fastq/
+        gzip fastq/{wildcards.sra_id}_1.fastq
+        gzip fastq/{wildcards.sra_id}_2.fastq
+        """
+
+rule download_reference:
+    output:
+        "reference/GCF_000738735.6_ASM73873v6_genomic.fna.gz"
+    params:
+        url = REF_URL
+    shell:
+        """
+        wget -O {output} {params.url}
+        """
+
+rule unzip_reference:
+    input:
+        "reference/GCF_000738735.6_ASM73873v6_genomic.fna.gz"
+    output:
+        REF_GENOME
+    shell:
+        """
+        gunzip -c {input} > {output}
+        """
+
+rule index_reference:
+    input:
+        REF_GENOME
+    output:
+        REF_GENOME + ".fai",
+        REF_GENOME.replace(".fna", ".dict")
+    shell:
+        """
+        samtools faidx {input}
+        gatk CreateSequenceDictionary -R {input}
+        """
+
+rule bwa_index:
+    input:
+        REF_GENOME
+    output:
+        REF_GENOME + ".bwt"
+    shell:
+        """
+        bwa index {input}
+        """
+
+# trim adapters with cutadapt - step 1.1.1
+rule trim_adapters:
+    input:
+        r1 = "fastq/{sra_id}_1.fastq.gz",
+        r2 = "fastq/{sra_id}_2.fastq.gz"
+    output:
+        r1 = "01_trimmed/{sra_id}_trimmed.R1.fq.gz",
+        r2 = "01_trimmed/{sra_id}_trimmed.R2.fq.gz"
+    params:
+        # add -u 5 -U 5 only for the listed individuals
+        extra = lambda w: ("-u 5 -U 5" if sra_to_individual[w.sra_id] in TRIM5_INDIVIDUALS else "")
+    threads: 8
+    shell:
+        r"""
+        cutadapt -j {threads} -m 30 -q 20 \
+            {params.extra} \
+            -a AGATCGGAAGAGCACACGTCTGAACTCCAGTCA \
+            -A AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT \
+            -o {output.r1} -p {output.r2} \
+            {input.r1} {input.r2}
+        """
+
+rule fastqc:
+    input:
+        "01_trimmed/{sra_id}_trimmed.{read}.fq.gz"
+    output:
+        html = "01_trimmed/00_fastqc/{sra_id}_trimmed.{read}_fastqc.html",
+        zip = "01_trimmed/00_fastqc/{sra_id}_trimmed.{read}_fastqc.zip"
+    threads: 8
+    shell:
+        """
+        mkdir -p 01_trimmed/00_fastqc
+        fastqc {input} -t {threads} --outdir 01_trimmed/00_fastqc
+        """
+
+# map reads with bwa mem - step 1.2.1
+
+rule map_reads:
+    input:
+        r1 = "01_trimmed/{sra_id}_trimmed.R1.fq.gz",
+        r2 = "01_trimmed/{sra_id}_trimmed.R2.fq.gz",
+        ref = REF_GENOME,
+        idx = REF_GENOME + ".bwt"
+    output:
+        bam = temp("02_mapped/bam_sorted/{sra_id}.sorted.bam")   # <- temp here
+    threads: 80
+    shell:
+        r"""
+        mkdir -p 02_mapped/bam_sorted
+        bwa mem -t {threads} -M {input.ref} {input.r1} {input.r2} > 02_mapped/{wildcards.sra_id}.sam
+        samtools view -bhq 6 -@ {threads} 02_mapped/{wildcards.sra_id}.sam > 02_mapped/{wildcards.sra_id}.bam
+        samtools sort -m 4G -@ {threads} 02_mapped/{wildcards.sra_id}.bam -o {output.bam}
+        rm 02_mapped/{wildcards.sra_id}.sam 02_mapped/{wildcards.sra_id}.bam
+        """
+
+# add read groups for each sra run
+rule add_read_groups:
+    input:
+        "02_mapped/bam_sorted/{sra_id}.sorted.bam"
+    output:
+        "03_readgrp/{sra_id}.bam"
+    params:
+        rgid = lambda w: w.sra_id,                         # RGID
+        rgsm = lambda w: sra_to_individual[w.sra_id],      # RGSM
+        rglb = lambda w: rglb_for(w.sra_id),               # RGLB (from library_info.tsv if available)
+        rgpl = "ILLUMINA",                                 # RGPL
+        rgpu = lambda w: w.sra_id                          # RGPU (use flowcell.lane if you know it)
+    threads: 4
+    shell:
+        r"""
+        mkdir -p 03_readgrp
+        gatk AddOrReplaceReadGroups \
+            -I {input} \
+            -O {output} \
+            -RGID {params.rgid} \
+            -RGSM {params.rgsm} \
+            -RGLB {params.rglb} \
+            -RGPL {params.rgpl} \
+            -RGPU {params.rgpu}
+        """
+
+
+# mark duplicates per individual - step 1.3.1
+# merge all sra runs for an individual
+
+rule mark_duplicates:
+    input:
+        # all SRA run BAMs for this individual
+        lambda w: expand("03_readgrp/{sra_id}.bam", sra_id=sra_data[w.individual])
+    output:
+        bam     = "04_markdup/{individual}_markdup_cleaned.bam",
+        bai     = "04_markdup/{individual}_markdup_cleaned.bai",
+        metrics = "04_markdup/{individual}_markdup.txt",
+        stats   = "04_markdup/00_stats/{individual}.alignments.txt"
+    threads: 8
+    container:
+        "/home/oven/links/scratch/crows2/containers/gatk4_4.6.2.0.sif"
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p 04_markdup 04_markdup/00_stats
+
+        # Build the -I arguments for MarkDuplicates
+        in_args=""
+        for bam in {input}; do
+            in_args="$in_args -I $bam"
+        done
+
+        gatk MarkDuplicates \
+            $in_args \
+            -O 04_markdup/{wildcards.individual}_markdup.bam \
+            -M {output.metrics} \
+            --REMOVE_DUPLICATES true \
+            --MAX_FILE_HANDLES_FOR_READ_ENDS_MAP 1000 \
+            --TMP_DIR 04_markdup
+
+        # Clean & index
+        gatk CleanSam \
+            -I 04_markdup/{wildcards.individual}_markdup.bam \
+            -O {output.bam} \
+            --CREATE_INDEX true
+
+        # Collect alignment metrics (requires REF_GENOME + .fai + .dict)
+        gatk CollectAlignmentSummaryMetrics \
+            -R {REF_GENOME} \
+            -I {output.bam} \
+            -O {output.stats} \
+            --METRIC_ACCUMULATION_LEVEL SAMPLE \
+            --METRIC_ACCUMULATION_LEVEL READ_GROUP
+
+        # Cleanup intermediate
+        rm -f 04_markdup/{wildcards.individual}_markdup.bam
+        """
+# PWD=$(pwd)
+# snakemake -j 8 --rerun-triggers mtime --use-singularity \
+#  --singularity-args "-B $PWD:$PWD -B /project -B /scratch --pwd $PWD"""
+
+rule mosdepth_100kb:
+    input:
+        bam = "04_markdup/{individual}_markdup_cleaned.bam",
+        bai = "04_markdup/{individual}_markdup_cleaned.bai"
+    output:
+        regions = "04_markdup/00_stats/{individual}.regions.bed.gz",
+        summary = "04_markdup/00_stats/{individual}.mosdepth.summary.txt"
+    threads: 4
+    container:
+        "/home/oven/links/scratch/crows2/containers/mosdepth_0.3.3.sif"
+    log:
+        "logs/mosdepth/{individual}.log"
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p 04_markdup/00_stats logs/mosdepth
+
+        PREFIX=$(readlink -f 04_markdup/00_stats/{wildcards.individual})
+        BAM=$(readlink -f {input.bam})
+
+        (
+          echo "PWD: $(pwd)"
+          echo "PREFIX: $PREFIX"
+          echo "BAM: $BAM"
+          ls -lh "$BAM" "$BAM.bai" || true
+          mosdepth --version || true
+        ) >> {log} 2>&1
+
+        mosdepth --threads {threads} --use-median --by 100000 \
+                 --fast-mode --no-per-base \
+                 "$PREFIX" "$BAM" >> {log} 2>&1
+
+        test -s {output.regions}
+        test -s {output.summary}
+        """
+
+
+# mapdamage- step 1.3.2
+rule mapdamage:
+    input:
+        bam = "04_markdup/{individual}_markdup_cleaned.bam",
+        ref = REF_GENOME
+    output:
+        rescaled = "04_markdup/{individual}_markdup_cleaned.rescaled.bam",
+        bai      = "04_markdup/{individual}_markdup_cleaned.rescaled.bai",
+        results  = directory("04_markdup/results_{individual}")  
+    threads: 2
+    shell:
+        r"""
+        set -euo pipefail
+
+        [ -f {input.ref}.fai ] || samtools faidx {input.ref}
+        [ -f {input.bam}.bai ] || samtools index -@ {threads} {input.bam}
+
+        rm -rf {output.results}
+
+        mapDamage -i {input.bam} -r {input.ref} -d {output.results} -t {threads} --merge-reference-sequences
+        mapDamage -i {input.bam} -r {input.ref} -d {output.results} -t {threads} --plot-only || true
+
+        if mapDamage --help | grep -q -- "--rescale-out"; then
+            mapDamage -i {input.bam} -r {input.ref} -d {output.results} -t {threads} \
+                      --rescale-only --rescale-out {output.rescaled}
+        else
+            mapDamage -i {input.bam} -r {input.ref} -d {output.results} -t {threads} --rescale-only
+            mv {output.results}/{wildcards.individual}_markdup_cleaned.rescaled.bam {output.rescaled}
+        fi
+
+        if command -v picard >/dev/null 2>&1; then
+            picard BuildBamIndex INPUT={output.rescaled} OUTPUT={output.bai} VALIDATION_STRINGENCY=SILENT
+        else
+            samtools index -@ {threads} {output.rescaled}
+        fi
+        """
+# cut -f1 reference/GCF_000738735.6_ASM73873v6_genomic.fna.fai > all_contigs.txt
+# printf "%s\n" NC_062298.1 NC_046357.1 > chrHaploid.scaffolds.list
+# grep -vxF -f chrHaploid.scaffolds.list all_contigs.txt \ > chrDiploid.scaffolds.list
+# split by ploidy - step 1.3.4
+rule split_ploidy:
+    input:
+        bam = "04_markdup/{individual}_markdup_cleaned.bam",
+        haploid = CHR_HAPLOID,
+        diploid = CHR_DIPLOID
+    output:
+        ploidy1 = "04_markdup/{individual}_markdup_cleaned.ploidy1.bam",
+        ploidy2 = "04_markdup/{individual}_markdup_cleaned.ploidy2.bam",
+        idx1 = "04_markdup/{individual}_markdup_cleaned.ploidy1.bam.bai",
+        idx2 = "04_markdup/{individual}_markdup_cleaned.ploidy2.bam.bai"
+    threads: 8
+    shell:
+        """
+        # extract haploid chromosomes (chrm, chrw)
+        samtools view -h {input.bam} -@ {threads} $(cat {input.haploid}) -o {output.ploidy1}
+        
+        # extract diploid chromosomes
+        samtools view -h {input.bam} -@ {threads} $(cat {input.diploid}) -o {output.ploidy2}
+        
+        # index both
+        samtools index -@ {threads} {output.ploidy1}
+        samtools index -@ {threads} {output.ploidy2}
+        """
+
+checkpoint contig_list:
+    input:
+        REF_GENOME + ".fai"
+    output:
+        "reference/contigs.list"
+    shell:
+        "cut -f1 {input} > {output}"
+
+ANGSD_SKIP_CHROMS = {
+    "NW_024108691.1",
+    "NC_062298.1",
+    "NW_024108680.1",
+}
+
+def per_chrom_vcfs(wc):
+    ck = checkpoints.contig_list.get()
+    with open(ck.output[0]) as f:
+        chroms = [
+            l.strip()
+            for l in f
+            if l.strip() and l.strip() not in ANGSD_SKIP_CHROMS
+        ]
+    return [
+        f"05.1_recal/angsd/{c}/134inds_rescaled_angsdrecalq30mindepth400genodepth3_min121.vcf.gz"
+        for c in chroms
+    ]
+
+# create bam file lists for variant calling
+rule create_bam_lists:
+    input:
+        expand("04_markdup/{individual}_markdup_cleaned.bam", individual=INDIVIDUALS)
+    output:
+        "bam_134inds_rescaled.filelist"
+    run:
+        with open(output[0], 'w') as f:
+            for bam in input:
+                f.write(f"{bam}\n")
+
+PLINK_BIN = "/scratch/oven/crows2/plink"
+
+rule angsd_call_chr:
+    input:
+        bamlist = "bam_134inds_rescaled.filelist",
+        ref     = REF_GENOME
+    output:
+        vcfgz = "05.1_recal/angsd/{chrom}/134inds_rescaled_angsdrecalq30mindepth400genodepth3_min121.vcf.gz",
+        vcfai = "05.1_recal/angsd/{chrom}/134inds_rescaled_angsdrecalq30mindepth400genodepth3_min121.vcf.gz.csi",
+        tped  = "05.1_recal/angsd/{chrom}/134inds_rescaled_angsdrecalq30mindepth400genodepth3_min121.tped"
+    threads: 32
+    params:
+        plink         = PLINK_BIN,  
+        min_depth      = 400,
+        max_depth      = 6800,
+        min_depth_ind  = 3,
+        min_ind        = 121,
+        min_mapq       = 30,
+        min_q          = 30,
+        geno_minDepth  = 0
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p 05.1_recal/angsd/{wildcards.chrom}
+        # 1) ANGSD per chromosome
+        angsd -out 05.1_recal/angsd/{wildcards.chrom}/134inds_rescaled_angsdrecalq30mindepth400genodepth3_min121 \
+            -bam {input.bamlist} \
+            -GL 2 -doMaf 2 -doMajorMinor 1 \
+            -nThreads {threads} \
+            -doCounts 1 -doDepth 1 \
+            -SNP_pval 1e-6 \
+            -ref {input.ref} \
+            -doPlink 2 -doGeno -4 -doPost 1 \
+            -geno_minDepth {params.geno_minDepth} \
+            -setMinDepth {params.min_depth} \
+            -setMaxDepth {params.max_depth} \
+            -setMinDepthInd {params.min_depth_ind} \
+            -minInd {params.min_ind} \
+            -minMapQ {params.min_mapq} \
+            -minQ {params.min_q} \
+            -r {wildcards.chrom}
+
+        # 2) convert to VCF
+        cd 05.1_recal/angsd/{wildcards.chrom}
+        {params.plink} --tfile 134inds_rescaled_angsdrecalq30mindepth400genodepth3_min121 \
+                       --allow-no-sex --allow-extra-chr \
+                       --recode vcf \
+                       --out 134inds_rescaled_angsdrecalq30mindepth400genodepth3_min121
+
+        bgzip -f 134inds_rescaled_angsdrecalq30mindepth400genodepth3_min121.vcf
+        bcftools index -f -c 134inds_rescaled_angsdrecalq30mindepth400genodepth3_min121.vcf.gz
+        """
+
+# NW_024108691.1, NC_062298.1, and NW_024108680.1 produce empty.tped files; not enough data ?
+
+rule angsd_concat_and_filter:
+    input:
+        vcfs = per_chrom_vcfs
+    output:
+        merged = "05.1_recal/angsd/merged/134inds_rescaled_angsdrecalq30mindepth400genodepth3_min121.vcf.gz",
+        merged_idx = "05.1_recal/angsd/merged/134inds_rescaled_angsdrecalq30mindepth400genodepth3_min121.vcf.gz.csi",
+        norepeats = "05.1_recal/angsd/merged/134inds_rescaled_angsdrecalq30mindepth400genodepth3_min121_norepeats.vcf.gz",
+        norepeats_idx = "05.1_recal/angsd/merged/134inds_rescaled_angsdrecalq30mindepth400genodepth3_min121_norepeats.vcf.gz.csi"
+    threads: 8
+    params:
+        repeat_bed = REPEAT_BED
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p 05.1_recal/angsd/merged
+
+        bcftools concat -a -Oz -o {output.merged} {input.vcfs}
+        bcftools index -f -c {output.merged}
+
+        vcftools --exclude-bed {params.repeat_bed} \
+                 --gzvcf {output.merged} \
+                 --recode --out 05.1_recal/angsd/merged/tmp_norepeats
+
+        bcftools view -Oz -o {output.norepeats} \
+                 05.1_recal/angsd/merged/tmp_norepeats.recode.vcf
+        bcftools index -f -c {output.norepeats}
+        rm -f 05.1_recal/angsd/merged/tmp_norepeats.recode.vcf
+        """
+
+
+rule ensure_reference_indexed:
+    input:
+        REF_GENOME,
+        REF_GENOME + ".fai",
+        REF_GENOME.replace(".fna", ".dict")
+
+# samtools/bcftools variant calling per scaffold - step 1.4.2
+rule samtools_call_scaffold:
+    input:
+        bamlist = "bam_134inds_rescaled.filelist",
+        ref = REF_GENOME
+    output:
+        vcf = "05.1_recal/samtools/134inds/134inds_samtools_scaffold_{scaffold}.vcf.gz"
+    params:
+        min_mapq = 30,
+        min_q = 30
+    shell:
+        """
+        mkdir -p 05.1_recal/samtools/134inds
+        
+        bcftools mpileup -f {input.ref} -b {input.bamlist} \
+            --redo-BAQ \
+            --annotate FORMAT/AD,FORMAT/ADF,FORMAT/ADR,FORMAT/DP,FORMAT/SP,INFO/AD,INFO/ADF,INFO/ADR \
+            -q {params.min_mapq} -Q {params.min_q} \
+            -r {wildcards.scaffold} | \
+        bcftools call -mv -f GQ -Oz -o {output.vcf}
+        """
+
+# merge samtools scaffolds and filter
+rule merge_filter_samtools:
+    input:
+        expand("05.1_recal/samtools/134inds/134inds_samtools_scaffold_{scaffold}.vcf.gz", 
+               scaffold=CHROM)
+    output:
+        merged = "05.1_recal/samtools/134inds/134inds_samtools.vcf.gz",
+        biallelic = "05.1_recal/samtools/134inds/134inds_samtools.V1.vcf.gz",
+        filtered = "05.1_recal/samtools/134inds/samtools_DP3GQ0Miss10Q30/134inds_samtools_DP3GQ0Miss10Q30_filtered_norepeats.vcf.gz"
+    threads: 128
+    params:
+        qual = 30,
+        mq = 40,
+        min_dp = 3,
+        min_gq = 0,
+        miss = 0.1,
+        repeat_bed = REPEAT_BED
+    shell:
+        r"""
+        set -euo pipefail
+    
+        # make sure parent dirs exist
+        mkdir -p "$(dirname {output.merged})"
+        mkdir -p "$(dirname {output.biallelic})"
+        mkdir -p "$(dirname {output.filtered})"
+    
+        # create an explicit file list from Snakemake 'input'
+        # (avoids fragile 'ls' globbing)
+        tmp_list=$(mktemp)
+        printf "%s\n" {input} | tr ' ' '\n' > "$tmp_list"
+    
+        # merge
+        bcftools concat --file-list "$tmp_list" -Oz -o {output.merged} --threads {threads}
+    
+        # biallelic SNPs only
+        bcftools view --threads {threads} -V indels --min-alleles 2 --max-alleles 2 \
+            -Oz -o {output.biallelic} {output.merged}
+    
+        # work inside the filter directory derived from the final output path
+        FILTER_DIR="$(dirname {output.filtered})"
+        mkdir -p "$FILTER_DIR"
+    
+        # V2: info-level filters
+        bcftools view --threads {threads} -Oz \
+            -o "$FILTER_DIR/134inds_samtools_DP3GQ0Miss10Q30.V2.vcf.gz" \
+            --exclude "QUAL < {params.qual} || MQ < {params.mq}" \
+            {output.biallelic}
+    
+        # V3: genotype-level filters
+        bcftools filter --threads {threads} -Oz \
+            -o "$FILTER_DIR/134inds_samtools_DP3GQ0Miss10Q30.V3.vcf.gz" \
+            --set-GTs . \
+            --include "FMT/DP >= {params.min_dp} & FMT/GQ >= {params.min_gq}" \
+            "$FILTER_DIR/134inds_samtools_DP3GQ0Miss10Q30.V2.vcf.gz"
+    
+        # V4: missingness filter
+        bcftools view --threads {threads} -Oz \
+            -o "$FILTER_DIR/134inds_samtools_DP3GQ0Miss10Q30_filtered.vcf.gz" \
+            --include "F_MISSING <= {params.miss}" \
+            "$FILTER_DIR/134inds_samtools_DP3GQ0Miss10Q30.V3.vcf.gz"
+    
+        # remove repeats
+        vcftools --exclude-bed {params.repeat_bed} \
+            --gzvcf "$FILTER_DIR/134inds_samtools_DP3GQ0Miss10Q30_filtered.vcf.gz" \
+            --recode --out "$FILTER_DIR/134inds_samtools_DP3GQ0Miss10Q30_filtered_norepeats"
+    
+        # bgzip + index final filtered_no-repeats VCF
+        bcftools view -Oz -o {output.filtered} \
+            "$FILTER_DIR/134inds_samtools_DP3GQ0Miss10Q30_filtered_norepeats.recode.vcf"
+        bcftools index -f -c {output.filtered}
+        rm -f "$FILTER_DIR/134inds_samtools_DP3GQ0Miss10Q30_filtered_norepeats.recode.vcf"
+    
+        rm -f "$tmp_list"
+        """
+
+# gatk haplotype caller per individual - step 1.4.3
+rule gatk_haplotype_caller:
+    input:
+        bam2 = "04_markdup/{individual}_markdup_cleaned.ploidy2.bam",
+        bam1 = "04_markdup/{individual}_markdup_cleaned.ploidy1.bam",
+        ref = REF_GENOME
+    output:
+        gvcf2 = "05.1_recal/GATKraw/{individual}.gvcf.gz",
+        gvcf1 = "05.1_recal/GATKraw/ploidy1/{individual}.gvcf.gz"
+    threads: 32
+    shell:
+        """
+        mkdir -p 05.1_recal/GATKraw/ploidy1
+        
+        # diploid chromosomes
+        gatk --java-options "-Xmx110G" HaplotypeCaller \
+            --native-pair-hmm-threads {threads} \
+            -I {input.bam2} \
+            -R {input.ref} \
+            -O {output.gvcf2} \
+            -ERC GVCF \
+            -ploidy 2 \
+            --output-mode EMIT_ALL_CONFIDENT_SITES \
+            -mbq 30
+        
+        # haploid chromosomes
+        gatk --java-options "-Xmx110G" HaplotypeCaller \
+            --native-pair-hmm-threads {threads} \
+            -I {input.bam1} \
+            -R {input.ref} \
+            -O {output.gvcf1} \
+            -ERC GVCF \
+            -ploidy 1 \
+            --output-mode EMIT_ALL_CONFIDENT_SITES \
+            -mbq 30
+        """
+
+rule make_sample_map:
+    input:
+        gvcfs = expand("05.1_recal/GATKraw/{individual}.gvcf.gz", individual=INDIVIDUALS)
+    output:
+        "05.1_recal/GATKraw/sample_map.tsv"
+    run:
+        with open(output[0], "w") as out:
+            for ind in INDIVIDUALS:
+                path = f"05.1_recal/GATKraw/{ind}.gvcf.gz"
+                out.write(f"{ind}\t{path}\n")
+
+rule genomicsdbimport_chr_diploid:
+    input:
+        sample_map = "05.1_recal/GATKraw/sample_map.tsv",
+        ref        = REF_GENOME
+    output:
+        db = directory("05.1_recal/GATKraw/scatter/gendb/diploid/{chrom}")
+    threads: 48
+    params:
+        chrom = lambda wc: wc.chrom
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p "$(dirname {output.db})"
+        export JAVA_TOOL_OPTIONS=-Xmx64G
+        gatk --java-options "-Xmx64G" GenomicsDBImport \
+            --sample-name-map {input.sample_map} \
+            -R {input.ref} \
+            -L {params.chrom} \
+            --genomicsdb-workspace-path {output.db} \
+            --reader-threads {threads} \
+            --consolidate true
+        """
+
+BIG_CHROMS = [
+    "NC_046333.1","NC_046334.1","NC_047057.1",
+    "NC_046332.1","NC_047056.1","NC_046335.1","NC_046337.1"
+]
+
+WIN = 25_000_000  
+
+
+checkpoint make_big_windows:
+    input:
+        REF_GENOME + ".fai"
+    output:
+        "reference/big_windows.bed"
+    run:
+        # read contig lengths from .fai
+        lengths = {}
+        with open(input[0]) as fai:
+            for line in fai:
+                c, n = line.split("\t", 2)[0], int(line.split("\t", 2)[1])
+                lengths[c] = n
+        # write windows only for BIG_CHROMS
+        with open(output[0], "w") as out:
+            for chrom in BIG_CHROMS:
+                n = lengths[chrom]
+                start = 0
+                while start < n:
+                    end = min(start + WIN, n)
+                    out.write(f"{chrom}\t{start}\t{end}\n")
+                    start = end
+
+
+rule genomicsdbimport_win:
+    input:
+        sample_map = "05.1_recal/GATKraw/sample_map.tsv",
+        ref        = REF_GENOME
+    output:
+        db = directory("05.1_recal/GATKraw/scatter/gendb/diploid_win/{chrom}/{start}-{end}")
+    threads: 12
+    params:
+        xmx = "64G",
+        interval = lambda w: f"{w.chrom}:{int(w.start)+1}-{w.end}"  
+    shell:
+        r"""
+        set -euo pipefail
+
+        TMPBASE="${{TMPDIR:-/tmp}}"
+        TMPDB="$TMPBASE/gendb_{wildcards.chrom}_{wildcards.start}_{wildcards.end}_$$$RANDOM"
+        [ ! -e "$TMPDB" ] || rm -rf "$TMPDB"
+
+        env -u _JAVA_OPTIONS -u JAVA_TOOL_OPTIONS \
+        gatk --java-options "-Xmx{params.xmx} -Djava.io.tmpdir=$TMPBASE" GenomicsDBImport \
+            --sample-name-map {input.sample_map} \
+            -R {input.ref} \
+            -L "{params.interval}" \
+            --batch-size 50 \
+            --genomicsdb-shared-posixfs-optimizations true \
+            --reader-threads {threads} \
+            --genomicsdb-workspace-path "$TMPDB"
+
+        rm -rf {output.db}
+        mkdir -p "$(dirname {output.db})"
+        mv "$TMPDB" {output.db}
+        """
+
+
+
+def gendb_win_dirs(_):
+    ck = checkpoints.make_big_windows.get()   # waits for the BED
+    bed = ck.output[0]
+    targets = []
+    with open(bed) as f:
+        for line in f:
+            chrom, start, end = line.strip().split("\t")
+            targets.append(
+                f"05.1_recal/GATKraw/scatter/gendb/diploid_win/{chrom}/{start}-{end}"
+            )
+    return targets
+
+rule gendb_win_dirs_n:
+    input:
+        gendb_win_dirs
+
+with open(CHR_DIPLOID) as f:
+    DIPLOID_CHROMS = [l.strip() for l in f if l.strip()]
+
+SMALL_CHROMS = [c for c in DIPLOID_CHROMS if c not in set(BIG_CHROMS)]
+
+def big_concat_targets(_):
+    return [f"05.1_recal/GATKraw/scatter/genotyped/diploid_win_concat/134inds_chrDiploid.{c}.vcf.gz"
+            for c in BIG_CHROMS]
+
+def small_chr_targets(_):
+    return [f"05.1_recal/GATKraw/scatter/genotyped/diploid/134inds_chrDiploid.{c}.vcf.gz"
+            for c in SMALL_CHROMS]
+
+
+def win_vcfs_for_chrom(wc):
+    ck = checkpoints.make_big_windows.get()
+    bed = ck.output[0]
+    outs = []
+    with open(bed) as f:
+        for line in f:
+            chrom, start, end = line.strip().split("\t")
+            if chrom == wc.chrom:
+                outs.append(f"05.1_recal/GATKraw/scatter/genotyped/diploid_win/134inds_chrDiploid.{chrom}.{start}-{end}.vcf.gz")
+    return outs
+
+rule genotype_from_gendb_win:
+    input:
+        db  = "05.1_recal/GATKraw/scatter/gendb/diploid_win/{chrom}/{start}-{end}",
+        ref = REF_GENOME
+    output:
+        "05.1_recal/GATKraw/scatter/genotyped/diploid_win/134inds_chrDiploid.{chrom}.{start}-{end}.vcf.gz"
+    threads: 10
+    params:
+        xmx = "32G",
+        interval = lambda w: f"{w.chrom}:{int(w.start)+1}-{w.end}"  
+    shell:
+        r"""
+        set -euo pipefail
+        env -u _JAVA_OPTIONS -u JAVA_TOOL_OPTIONS \
+        gatk --java-options "-Xmx{params.xmx}" GenotypeGVCFs \
+            -R {input.ref} \
+            -V gendb://{input.db} \
+            -L "{params.interval}" \
+            --max-alternate-alleles 4 \
+            -ploidy 2 \
+            --include-non-variant-sites \
+            -O {output}
+        bcftools index {output}
+        """
+
+rule concat_windows_per_chrom:
+    input: win_vcfs_for_chrom
+    output:
+        "05.1_recal/GATKraw/scatter/genotyped/diploid_win_concat/134inds_chrDiploid.{chrom}.vcf.gz"
+    threads: 8
+    shell:
+        r"""
+        set -euo pipefail
+        bcftools concat --threads {threads} -Oz -o {output} {input}
+        bcftools index {output}
+        """
+
+rule genotype_from_gendb_chr_diploid:
+    input:
+        db  = "05.1_recal/GATKraw/scatter/gendb/diploid/{chrom}",
+        ref = REF_GENOME
+    output:
+        "05.1_recal/GATKraw/scatter/genotyped/diploid/134inds_chrDiploid.{chrom}.vcf.gz"
+    threads: 8
+    params:
+        chrom = lambda wc: wc.chrom
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p 05.1_recal/GATKraw/scatter/genotyped/diploid
+
+        gatk --java-options "-Xmx128G" GenotypeGVCFs \
+            -R {input.ref} \
+            -V gendb://{input.db} \
+            -L {params.chrom} \
+            --max-alternate-alleles 4 \
+            -ploidy 2 \
+            --include-non-variant-sites \
+            -O {output}
+
+        bcftools index {output}
+        """
+
+rule genotype:
+    input:
+        big_concat_targets,
+        small_chr_targets
+
+
+with open(CHR_DIPLOID) as f:
+    DIPLOID_CHROMS = [l.strip() for l in f if l.strip()]
+SMALL_CHROMS = [c for c in DIPLOID_CHROMS if c not in set(BIG_CHROMS)]
+
+rule gather_genotyped_diploid:
+    input:
+        [f"05.1_recal/GATKraw/scatter/genotyped/diploid_win_concat/134inds_chrDiploid.{c}.vcf.gz"
+         for c in BIG_CHROMS]
+        +
+        [f"05.1_recal/GATKraw/scatter/genotyped/diploid/134inds_chrDiploid.{c}.vcf.gz"
+         for c in SMALL_CHROMS]
+    output:
+        "05.1_recal/GATKraw/134inds_chrDiploid.vcf.gz"
+    threads: 64
+    shell:
+        r"""
+        set -euo pipefail
+        bcftools concat --threads {threads} -Oz -o {output} {input}
+        bcftools index {output}
+        """
+
+
+rule filter_genotyped_vcf:
+    input:
+        genotyped = "05.1_recal/GATKraw/134inds_chrDiploid.vcf.gz",
+        repeat_bed = REPEAT_BED
+    output:
+        variant_only = "05.1_recal/GATKraw/134inds_varonly_chrDiploid.V1.vcf.gz",
+        filtered = "05.1_recal/GATKraw/134inds_DP3GQ0Miss10fullinfoQ100/134inds_varonly_chrDiploid_DP3GQ0Miss10fullinfoQ100_filtered_norepeats.vcf.gz"
+    threads: 64
+    params:
+        qd = 2,
+        fs = 60,
+        sor = 3,
+        mq = 40,
+        mq_ranksum = -12.5,
+        readpos_ranksum = -8,
+        qual = 100,
+        min_dp = 3,
+        min_gq = 0,
+        miss = 0.1
+    shell:
+        """
+        filter_dir="05.1_recal/GATKraw/134inds_DP3GQ0Miss10fullinfoQ100"
+        mkdir -p "$filter_dir"
+        prefix="$filter_dir/134inds_varonly_chrDiploid_DP3GQ0Miss10fullinfoQ100"
+        
+        # extract variant sites only (biallelic SNPs) from genotyped VCF
+        bcftools view --threads {threads} -V indels --min-alleles 2 --max-alleles 2 \
+            -Oz -o {output.variant_only} {input.genotyped}
+        bcftools index {output.variant_only}
+        
+        # info-level filter
+        bcftools view --threads {threads} -Oz \
+            -o "${{prefix}}.V2.vcf.gz" \
+            --exclude "QD < {params.qd} || FS > {params.fs} || SOR > {params.sor} || QUAL < {params.qual} || MQ < {params.mq} || MQRankSum < {params.mq_ranksum} || ReadPosRankSum < {params.readpos_ranksum}" \
+            {output.variant_only}
+        
+        # genotype-level filter
+        bcftools filter --threads {threads} -Oz \
+            -o "${{prefix}}.V3.vcf.gz" \
+            --set-GTs . \
+            --include "FMT/DP >= {params.min_dp} & FMT/GQ >= {params.min_gq}" \
+            "${{prefix}}.V2.vcf.gz"
+        
+        # remove high missingness
+        bcftools view --threads {threads} -Oz \
+            -o "${{prefix}}_filtered.vcf.gz" \
+            --include "F_MISSING <= {params.miss}" \
+            "${{prefix}}.V3.vcf.gz"
+        
+        # remove repeat regions
+        vcftools --exclude-bed {input.repeat_bed} \
+            --gzvcf "${{prefix}}_filtered.vcf.gz" \
+            --recode --out "${{prefix}}_filtered_norepeats"
+        
+        # compress & index final VCF
+        bcftools view -Oz -o {output.filtered} \
+            "${{prefix}}_filtered_norepeats.recode.vcf"
+        bcftools index {output.filtered}
+        rm "${{prefix}}_filtered_norepeats.recode.vcf"
+        """
+
+rule find_overlap_and_filter:
+    input:
+        gatk = "05.1_recal/GATKraw/134inds_DP3GQ0Miss10fullinfoQ100/134inds_varonly_chrDiploid_DP3GQ0Miss10fullinfoQ100_filtered_norepeats.vcf.gz",
+        samtools = "05.1_recal/samtools/134inds/samtools_DP3GQ0Miss10Q30/134inds_samtools_DP3GQ0Miss10Q30_filtered_norepeats.vcf.gz",
+        angsd = "05.1_recal/angsd/merged/134inds_rescaled_angsdrecalq30mindepth400genodepth3_min121.vcf.gz",
+        overlap_py = "overlap.py"
+    output:
+        positions = "05.1_recal/overlap/overlap_allcallers.pos",
+        vcf = "05.1_recal/overlap/134inds_overlapped_filtered_norepeats.vcf.gz"
+    threads: 80
+    params:
+        mq = 40,
+        qual = 30,
+        min_dp = 3,
+        miss = 0.1
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p 05.1_recal/overlap
+
+        bcftools query -f '%CHROM %POS\n' {input.gatk}    | awk '{{print $1"_"$2}}' > 05.1_recal/overlap/gatk_pos.txt
+        bcftools query -f '%CHROM %POS\n' {input.samtools}| awk '{{print $1"_"$2}}' > 05.1_recal/overlap/samtools_pos.txt
+        bcftools query -f '%CHROM %POS\n' {input.angsd}   | awk '{{print $1"_"$2}}' > 05.1_recal/overlap/angsd_pos.txt
+
+        # Python overlap (writes overlapping_variants_pos.txt)
+        python3 {input.overlap_py} \
+            --gatk    05.1_recal/overlap/gatk_pos.txt \
+            --samtools 05.1_recal/overlap/samtools_pos.txt \
+            --angsd    05.1_recal/overlap/angsd_pos.txt \
+            --out      05.1_recal/overlap/overlapping_variants_pos.txt
+
+        # Convert to vcftools --positions format (CHROM<tab>POS)
+        # Split on LAST underscore since chromosome names contain underscores
+        tail -n +2 05.1_recal/overlap/overlapping_variants_pos.txt | rev | sed 's/_/\t/' | rev > {output.positions}
+
+        # Verify positions file was created correctly
+        echo "First 5 lines of positions file:"
+        head -5 {output.positions}
+        echo "Total positions: $(wc -l < {output.positions})"
+
+        vcftools --positions {output.positions} \
+            --gzvcf {input.samtools} \
+            --recode --out 05.1_recal/overlap/134inds_overlapped
+
+        bcftools view --threads {threads} -Oz \
+            -o 05.1_recal/overlap/134inds_overlapped.V1.vcf.gz \
+            --exclude "QUAL < {params.qual} || MQ < {params.mq}" \
+            05.1_recal/overlap/134inds_overlapped.recode.vcf
+
+        bcftools filter --threads {threads} -Oz \
+            -o 05.1_recal/overlap/134inds_overlapped.V2.vcf.gz \
+            --set-GTs . \
+            --include "FMT/DP >= {params.min_dp}" \
+            05.1_recal/overlap/134inds_overlapped.V1.vcf.gz
+
+        bcftools view --threads {threads} -Oz \
+            -o {output.vcf} \
+            --include "F_MISSING <= {params.miss}" \
+            05.1_recal/overlap/134inds_overlapped.V2.vcf.gz
+
+        bcftools index -f -c {output.vcf}
+        vcftools --gzvcf {output.vcf} --freq --out 05.1_recal/overlap/134inds_overlapped_filtered_norepeats
+
+        rm -f 05.1_recal/overlap/134inds_overlapped.recode.vcf 05.1_recal/overlap/134inds_overlapped.V*.vcf.gz
+        """
+
+def get_pop_samples(poplist_file, pop_name):
+    samples = []
+    with open(poplist_file) as f:
+        next(f)  # skip header
+        for line in f:
+            parts = line.strip().split('\t')
+            if len(parts) >= 2 and parts[1] == pop_name:
+                samples.append(parts[0])
+    return samples
+
+rule create_cnx3_popfile:
+    input:
+        poplist = POPLIST
+    output:
+        "05.1_recal/overlap/cnx3.pop"
+    run:
+        samples = []
+        with open(input.poplist) as f:
+            next(f)  # skip header
+            for line in f:
+                parts = line.strip().split('\t')
+                # parts[0] = sample (A01, P01, etc.)
+                # parts[1] = pop (cnx3, cor1, etc.)
+                # parts[2] = taxa
+                # parts[3] = sample_id (PL_Wa_H02, etc.) 
+                if len(parts) >= 4 and parts[1] == "cnx3":
+                    samples.append(parts[3])
+        with open(output[0], 'w') as f:
+            for s in samples:
+                f.write(f"{s}\n")
+
+rule filter_paralogs_hwe:
+    input:
+        vcf = "05.1_recal/overlap/134inds_overlapped_filtered_norepeats.vcf.gz",
+        cnx3_pop = "05.1_recal/overlap/cnx3.pop"
+    output:
+        cnx3_vcf = temp("05.1_recal/overlap/134inds_overlapped_filtered_norepeats_cnx3.recode.vcf"),
+        hwe = "05.1_recal/overlap/134inds_overlapped_filtered_norepeats_cnx3.hwe",
+        hwe_pos = "05.1_recal/overlap/134inds_overlapped_filtered_norepeats_cnx3_hwedis.pos",
+        filtered_vcf = "05.1_recal/overlap/134inds_overlapped_filtered_norepeats_hwe.vcf.gz",
+        filtered_idx = "05.1_recal/overlap/134inds_overlapped_filtered_norepeats_hwe.vcf.gz.csi"
+    params:
+        hwe_pval = 0.05,
+        exclude_chrom = "NC_046347.1"  # chr18
+    threads: 8
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p 05.1_recal/overlap
+
+        # Subset to cnx3 population
+        vcftools --gzvcf {input.vcf} \
+            --keep {input.cnx3_pop} \
+            --recode --out 05.1_recal/overlap/134inds_overlapped_filtered_norepeats_cnx3
+
+        # Calculate Hardy-Weinberg statistics
+        vcftools --vcf {output.cnx3_vcf} \
+            --hardy --out 05.1_recal/overlap/134inds_overlapped_filtered_norepeats_cnx3
+
+        # Extract positions that deviate from HWE (p < 0.05), excluding chr18
+        awk 'NR>1 && $6<{params.hwe_pval} {{print $1, $2}}' {output.hwe} \
+            | grep -v "^{params.exclude_chrom} " \
+            > {output.hwe_pos}
+
+        # Count sites being removed
+        echo "HWE-deviant sites to remove (excluding chr18): $(wc -l < {output.hwe_pos})"
+
+        # Remove HWE-deviant sites from the full VCF
+        vcftools --gzvcf {input.vcf} \
+            --exclude-positions {output.hwe_pos} \
+            --recode --out 05.1_recal/overlap/134inds_overlapped_filtered_norepeats_hwe
+
+        # Compress and index
+        bcftools view -Oz -o {output.filtered_vcf} \
+            05.1_recal/overlap/134inds_overlapped_filtered_norepeats_hwe.recode.vcf
+        bcftools index -c {output.filtered_vcf}
+
+        # Cleanup
+        rm -f 05.1_recal/overlap/134inds_overlapped_filtered_norepeats_hwe.recode.vcf
+
+        # Report final counts
+        echo "Final SNP count after HWE filtering:"
+        bcftools view -H {output.filtered_vcf} | wc -l
+        """
+
+# outgroup download and convert
+rule download_outgroup_sra:
+    output:
+        "outgroup/sra/{outgroup_id}.sra"
+    shell:
+        """
+        prefetch {wildcards.outgroup_id} --output-file {output}
+        """
+
+rule convert_outgroup_fastq:
+    input:
+        "outgroup/sra/{outgroup_id}.sra"
+    output:
+        r1 = "outgroup/fastq/{individual}/{outgroup_id}_1.fastq",
+        r2 = "outgroup/fastq/{individual}/{outgroup_id}_2.fastq"
+    threads: 16
+    shell:
+        """
+        mkdir -p outgroup/fastq/{wildcards.individual}
+        fasterq-dump {input} --split-files -e {threads} -p --outdir outgroup/fastq/{wildcards.individual}/
+        gzip outgroup/fastq/{wildcards.individual}/{wildcards.outgroup_id}_1.fastq
+        gzip outgroup/fastq/{wildcards.individual}/{wildcards.outgroup_id}_2.fastq
+        """
+
+rule trim_outgroup:
+    input:
+        r1 = "outgroup/fastq/{individual}/{outgroup_id}_1.fastq",
+        r2 = "outgroup/fastq/{individual}/{outgroup_id}_2.fastq"
+    output:
+        r1 = "outgroup/01_trimmed/{individual}/{outgroup_id}_trimmed.R1.fq.gz",
+        r2 = "outgroup/01_trimmed/{individual}/{outgroup_id}_trimmed.R2.fq.gz"
+    threads: 8
+    shell:
+        """
+        mkdir -p outgroup/01_trimmed/{wildcards.individual}
+        cutadapt -j {threads} -m 30 -q 20 \
+            -a AGATCGGAAGAGCACACGTCTGAACTCCAGTCA \
+            -A AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT \
+            -o {output.r1} -p {output.r2} \
+            {input.r1} {input.r2}
+        """
+
+rule map_outgroup:
+    input:
+        r1 = "outgroup/01_trimmed/{individual}/{outgroup_id}_trimmed.R1.fq.gz",
+        r2 = "outgroup/01_trimmed/{individual}/{outgroup_id}_trimmed.R2.fq.gz",
+        ref = REF_GENOME,
+        idx = REF_GENOME + ".bwt"
+    output:
+        bam = temp("outgroup/02_mapped/{individual}/{outgroup_id}.sorted.bam")
+    threads: 80
+    shell:
+        """
+        mkdir -p outgroup/02_mapped/{wildcards.individual}
+        bwa mem -t {threads} -M {input.ref} {input.r1} {input.r2} > outgroup/02_mapped/{wildcards.individual}/{wildcards.outgroup_id}.sam
+        samtools view -bhq 6 -@ {threads} outgroup/02_mapped/{wildcards.individual}/{wildcards.outgroup_id}.sam > outgroup/02_mapped/{wildcards.individual}/{wildcards.outgroup_id}.bam
+        samtools sort -m 4G -@ {threads} outgroup/02_mapped/{wildcards.individual}/{wildcards.outgroup_id}.bam -o {output.bam}
+        rm outgroup/02_mapped/{wildcards.individual}/{wildcards.outgroup_id}.sam outgroup/02_mapped/{wildcards.individual}/{wildcards.outgroup_id}.bam
+        """
+
+rule add_outgroup_readgroups:
+    input:
+        "outgroup/02_mapped/{individual}/{outgroup_id}.sorted.bam"
+    output:
+        "outgroup/03_readgrp/{individual}/{outgroup_id}.bam"
+    params:
+        rgid = lambda w: w.outgroup_id,
+        rgsm = lambda w: w.individual,
+        rglb = lambda w: w.individual,
+        rgpl = "ILLUMINA",
+        rgpu = lambda w: w.outgroup_id
+    threads: 4
+    shell:
+        """
+        mkdir -p outgroup/03_readgrp/{wildcards.individual}
+        gatk AddOrReplaceReadGroups \
+            -I {input} \
+            -O {output} \
+            -RGID {params.rgid} \
+            -RGSM {params.rgsm} \
+            -RGLB {params.rglb} \
+            -RGPL {params.rgpl} \
+            -RGPU {params.rgpu}
+        """
+
+rule mark_duplicates_outgroup:
+    input:
+        lambda w: expand("outgroup/03_readgrp/{individual}/{oid}.bam", 
+                        individual=w.individual, 
+                        oid=outgroup_data[w.individual])
+    output:
+        bam = "outgroup/04_markdup/{individual}_markdup.bam",
+        bai = "outgroup/04_markdup/{individual}_markdup.bai",
+        metrics = "outgroup/04_markdup/{individual}_markdup.txt"
+    threads: 8
+    shell:
+        """
+        set -euo pipefail
+        mkdir -p outgroup/04_markdup
+
+        in_args=""
+        for bam in {input}; do
+            in_args="$in_args -I $bam"
+        done
+
+        gatk MarkDuplicates \
+            $in_args \
+            -O {output.bam} \
+            -M {output.metrics} \
+            --REMOVE_DUPLICATES true \
+            --CREATE_INDEX true
+        """
+
+
+rule haplotype_caller_outgroup:
+    input:
+        bam = "outgroup/04_markdup/{individual}_markdup.bam",
+        bai = "outgroup/04_markdup/{individual}_markdup.bai",
+        ref = REF_GENOME
+    output:
+        gvcf = "outgroup/05_gvcf/{individual}.g.vcf.gz",
+        idx = "outgroup/05_gvcf/{individual}.g.vcf.gz.tbi"
+    threads: 32
+    shell:
+        """
+        mkdir -p outgroup/05_gvcf
+        gatk --java-options "-Xmx110G" HaplotypeCaller \
+            --native-pair-hmm-threads {threads} \
+            -I {input.bam} \
+            -R {input.ref} \
+            -O {output.gvcf} \
+            -ERC GVCF
+        """
+
+rule genomicsdb_outgroup:
+    input:
+        gvcfs = lambda wc: expand("outgroup/05_gvcf/{sample}.g.vcf.gz", sample=species_samples[wc.species]),
+        idxs = lambda wc: expand("outgroup/05_gvcf/{sample}.g.vcf.gz.tbi", sample=species_samples[wc.species]),
+        ref = REF_GENOME
+    output:
+        db = directory("outgroup/06_genomicsdb/{species}/chr_{chrom}")
+    threads: 32
+    shell:
+        """
+        mkdir -p outgroup/06_genomicsdb/{wildcards.species}
+        
+        gvcf_args=""
+        for g in {input.gvcfs}; do
+            gvcf_args="$gvcf_args -V $g"
+        done
+
+        gatk --java-options "-Xmx64G" GenomicsDBImport \
+            $gvcf_args \
+            --genomicsdb-workspace-path {output.db} \
+            -L {wildcards.chrom} \
+            --reader-threads {threads}
+        """
+
+rule genotype_outgroup:
+    input:
+        db = "outgroup/06_genomicsdb/{species}/chr_{chrom}",
+        ref = REF_GENOME
+    output:
+        vcf = "outgroup/07_vcfs/{species}/chr_{chrom}_genotyped.vcf.gz",
+        idx = "outgroup/07_vcfs/{species}/chr_{chrom}_genotyped.vcf.gz.tbi"
+    threads: 32
+    shell:
+        """
+        mkdir -p outgroup/07_vcfs/{wildcards.species}
+        gatk --java-options "-Xmx64G" GenotypeGVCFs \
+            -R {input.ref} \
+            -V gendb://{input.db} \
+            -O {output.vcf}
+        """
+
+rule filter_outgroup_vcf:
+    input:
+        vcf = "outgroup/07_vcfs/{species}/chr_{chrom}_genotyped.vcf.gz",
+        idx = "outgroup/07_vcfs/{species}/chr_{chrom}_genotyped.vcf.gz.tbi"
+    output:
+        vcf = "outgroup/07_vcfs/{species}/chr_{chrom}_filtered.vcf.gz",
+        idx = "outgroup/07_vcfs/{species}/chr_{chrom}_filtered.vcf.gz.tbi"
+    shell:
+        """
+        bcftools view -V indels --min-alleles 2 --max-alleles 2 \
+            -Oz -o {output.vcf} {input.vcf}
+        bcftools index -t {output.vcf}
+        """
+
+rule intersect_outgroup_ingroup:
+    input:
+        out_vcf = "outgroup/07_vcfs/{species}/chr_{chrom}_filtered.vcf.gz",
+        out_idx = "outgroup/07_vcfs/{species}/chr_{chrom}_filtered.vcf.gz.tbi",
+        in_vcf = "06_phased/per_chrom/134inds_phased.{chrom}.vcf.gz"
+    output:
+        vcf = "outgroup/08_isec/{species}/chr_{chrom}_isec.vcf.gz",
+        idx = "outgroup/08_isec/{species}/chr_{chrom}_isec.vcf.gz.tbi"
+    shell:
+        """
+        mkdir -p outgroup/08_isec/{wildcards.species}
+        bcftools isec -n=2 -w1 {input.out_vcf} {input.in_vcf} | bgzip -c > {output.vcf}
+        bcftools index -t {output.vcf}
+        """
+
+rule outgroup_vcfs:
+    input:
+        [f"outgroup/08_isec/{species}/chr_{chrom}_isec.vcf.gz"
+         for species in species_samples.keys()
+         for chrom in PHASE_CHROMS]
+
+# phasing with beagle
+rule phase_vcf_per_chrom:
+    input:
+        vcf = "05.1_recal/overlap/134inds_overlapped_filtered_norepeats_hwe.vcf.gz"
+    output:
+        phased = "06_phased/per_chrom/134inds_phased.{chrom}.vcf.gz",
+        index = "06_phased/per_chrom/134inds_phased.{chrom}.vcf.gz.tbi"
+    params:
+        prefix = "06_phased/per_chrom/134inds_phased.{chrom}"
+    threads: 16
+    shell:
+        """
+        mkdir -p 06_phased/per_chrom
+        java -Xmx100g -jar beagle.27Feb25.75f.jar \
+            gt={input.vcf} \
+            out={params.prefix} \
+            chrom={wildcards.chrom} \
+            nthreads={threads} \
+            impute=false
+        bcftools index -t {output.phased}
+        """
+
+rule concat_phased:
+    input:
+        vcfs = expand("06_phased/per_chrom/134inds_phased.{chrom}.vcf.gz", chrom=PHASE_CHROMS),
+        idxs = expand("06_phased/per_chrom/134inds_phased.{chrom}.vcf.gz.tbi", chrom=PHASE_CHROMS)
+    output:
+        "06_phased/134inds_phased.vcf.gz"
+    threads: 8
+    shell:
+        """
+        bcftools concat --threads {threads} -Oz -o {output} {input.vcfs}
+        bcftools index -t {output}
+        """
+
+rule index_phased:
+    input:
+        "06_phased/134inds_phased.vcf.gz"
+    output:
+        "06_phased/134inds_phased.vcf.gz.tbi"
+    shell:
+        """
+        bcftools index -t {input}
+        """
+
+rule est_sfs_input_per_chrom:
+    input:
+        in_vcf = "06_phased/per_chrom/134inds_phased.{chrom}.vcf.gz",
+        out_vcf1 = "outgroup/08_isec/american_crow/chr_{chrom}_isec.vcf.gz",
+        out_vcf2 = "outgroup/08_isec/rook/chr_{chrom}_isec.vcf.gz",
+        out_vcf3 = "outgroup/08_isec/jackdaw/chr_{chrom}_isec.vcf.gz"
+    output:
+        "07_estsfs/{chrom}/estsfs_input.txt"
+    shell:
+        """
+        mkdir -p 07_estsfs/{wildcards.chrom}
+        python3 est-sfs-input.py {input.in_vcf} {output} {input.out_vcf1} {input.out_vcf2} {input.out_vcf3}
+        """
+
+PARTS = range(1, 5)
+
+rule split_estsfs_per_chrom:
+    input:
+        "07_estsfs/{chrom}/estsfs_input.txt"
+    output:
+        expand("07_estsfs/{{chrom}}/estsfs_input_part{part}.txt", part=PARTS)
+    shell:
+        """
+        line_count=$(wc -l < {input})
+        if [ "$line_count" -lt 4 ]; then
+            for i in {{1..4}}; do
+                cp {input} 07_estsfs/{wildcards.chrom}/estsfs_input_part$i.txt
+            done
+        else
+            chunk_size=$(( (line_count + 3) / 4 ))
+            split -l $chunk_size -d --additional-suffix=.txt {input} 07_estsfs/{wildcards.chrom}/estsfs_input_part
+            for i in {{0..3}}; do
+                mv 07_estsfs/{wildcards.chrom}/estsfs_input_part0$i.txt 07_estsfs/{wildcards.chrom}/estsfs_input_part$((i+1)).txt
+            done
+        fi
+        """
+
+rule run_est_sfs_per_chrom:
+    input:
+        config = "config-kimura.txt",
+        data = "07_estsfs/{chrom}/estsfs_input_part{part}.txt",
+        seed = "seedfile.txt"
+    output:
+        sfs = "07_estsfs/{chrom}/output/output-file-sfs_part{part}.txt",
+        pvals = "07_estsfs/{chrom}/output/output-file-pvalues_part{part}.txt"
+    shell:
+        """
+        mkdir -p 07_estsfs/{wildcards.chrom}/output
+        est-sfs-release-2.04/est-sfs {input.config} {input.data} {input.seed} {output.sfs} {output.pvals}
+        """
+
+rule est_sfs_all:
+    input:
+        expand("07_estsfs/{chrom}/output/output-file-sfs_part{part}.txt", 
+               chrom=PHASE_CHROMS, 
+               part=PARTS)
+
+# ldhelmet for recombination maps
+
+SWED = [
+    "S_Up_H09", "S_Up_H16", "S_Up_H24", "S_Up_H29", "S_Up_H37",
+    "S_Up_H43", "S_Up_H47", "S_Up_H51", "S_Up_H52",
+    "S_Ri_H29", "S_Ri_H05", "S_Ri_H23", "S_Ri_H43", "S_Ri_H07"
+]
+
+rule select_variants_swed:
+    input:
+        vcf = "06_phased/per_chrom/134inds_phased.{chrom}.vcf.gz",
+        ref = REF_GENOME
+    output:
+        vcf = "10_ldhelmet/vcfs/swed_{chrom}.vcf.gz"
+    params:
+        sample_flags = lambda wildcards: " ".join(f"--sample-name {sample}" for sample in SWED)
+    shell:
+        """
+        mkdir -p 10_ldhelmet/vcfs
+        gatk SelectVariants \
+            -R {input.ref} \
+            -V {input.vcf} \
+            {params.sample_flags} \
+            -O {output.vcf}
+        """
+
+rule vcf2ldhelmet_fasta:
+    input:
+        vcf = "10_ldhelmet/vcfs/swed_{chrom}.vcf.gz"
+    output:
+        fasta = "10_ldhelmet/input/{chrom}.FINAL_INPUT.fasta",
+        pos = "10_ldhelmet/input/{chrom}.snp.pos.file"
+    shell:
+        r"""
+        mkdir -p 10_ldhelmet/input
+        
+        vcftools \
+            --gzvcf {input.vcf} \
+            --plink \
+            --out 10_ldhelmet/input/{wildcards.chrom}
+
+        ./plink \
+            --ped 10_ldhelmet/input/{wildcards.chrom}.ped \
+            --map 10_ldhelmet/input/{wildcards.chrom}.map \
+            --recode fastphase \
+            --out 10_ldhelmet/input/{wildcards.chrom}
+
+        cd 10_ldhelmet/input/
+
+        phasefile="{wildcards.chrom}.chr-0.recode.phase.inp"
+
+        grep '^P' "$phasefile" \
+            | sed 's/ /\n/g' \
+            | tail -n +2 > {wildcards.chrom}.snp.pos.file
+
+        tail -n +4 "$phasefile" \
+            | sed 's/#/>/g' \
+            | sed 's/ /_/g' > {wildcards.chrom}.temp
+
+        grep '>' {wildcards.chrom}.temp > {wildcards.chrom}.ID_1
+        awk '{{print $1 "_2"}}' {wildcards.chrom}.ID_1 > {wildcards.chrom}.ID_2
+
+        sed -n '2~3p' {wildcards.chrom}.temp > {wildcards.chrom}.H1
+        sed -n '3~3p' {wildcards.chrom}.temp > {wildcards.chrom}.H2
+
+        paste {wildcards.chrom}.ID_1 {wildcards.chrom}.H1 \
+            | tr "\t" "\n" > {wildcards.chrom}.ID_1_H1
+        paste {wildcards.chrom}.ID_2 {wildcards.chrom}.H2 \
+            | tr "\t" "\n" > {wildcards.chrom}.ID_2_H2
+
+        cat {wildcards.chrom}.ID_1_H1 {wildcards.chrom}.ID_2_H2 \
+            > {wildcards.chrom}.FINAL_INPUT.fasta
+
+        rm -f {wildcards.chrom}.ID_1 \
+              {wildcards.chrom}.ID_2 \
+              {wildcards.chrom}.H1 \
+              {wildcards.chrom}.H2 \
+              {wildcards.chrom}.ID_1_H1 \
+              {wildcards.chrom}.ID_2_H2 \
+              {wildcards.chrom}.temp \
+              {wildcards.chrom}.ped \
+              {wildcards.chrom}.map \
+              {wildcards.chrom}.chr-0.recode.phase.inp
+        """
+
+rule find_confs:
+    input:
+        "10_ldhelmet/input/{chrom}.FINAL_INPUT.fasta"
+    output:
+        "10_ldhelmet/conf/{chrom}.conf"
+    threads: 60
+    shell:
+        """
+        mkdir -p 10_ldhelmet/conf
+        LDhelmet/ldhelmet find_confs \
+            --num_threads {threads} \
+            -w 50 \
+            -o {output} \
+            {input}
+        """
+
+rule table_gen:
+    input:
+        conf = "10_ldhelmet/conf/{chrom}.conf"
+    output:
+        lk = "10_ldhelmet/lk/{chrom}.lk"
+    threads: 40
+    params:
+        theta = 0.0019,
+        rgrid = "0.0 0.1 10.0 1.0 100.0"
+    shell:
+        """
+        mkdir -p 10_ldhelmet/lk
+        LDhelmet/ldhelmet table_gen \
+            --num_threads {threads} \
+            -c {input.conf} \
+            -t {params.theta} \
+            -r {params.rgrid} \
+            -o {output.lk}
+        """
+
+rule pade:
+    input:
+        conf = "10_ldhelmet/conf/{chrom}.conf"
+    output:
+        pade = "10_ldhelmet/pade/{chrom}.pade"
+    threads: 96
+    params:
+        theta = 0.0019,
+        x = 12
+    shell:
+        """
+        mkdir -p 10_ldhelmet/pade
+        LDhelmet/ldhelmet pade \
+            --num_threads {threads} \
+            -c {input.conf} \
+            -t {params.theta} \
+            -x {params.x} \
+            -o {output.pade}
+        """
+
+rule rjmcmc:
+    input:
+        fasta = "10_ldhelmet/input/{chrom}.FINAL_INPUT.fasta",
+        pos = "10_ldhelmet/input/{chrom}.snp.pos.file",
+        lk = "10_ldhelmet/lk/{chrom}.lk",
+        pade = "10_ldhelmet/pade/{chrom}.pade"
+    output:
+        post = "10_ldhelmet/post/{chrom}.post"
+    threads: 40
+    params:
+        window = 50,
+        block_penalty = 50.0,
+        burn_in = 100000,
+        n_iter = 1000000
+    shell:
+        """
+        mkdir -p 10_ldhelmet/post
+        LDhelmet/ldhelmet rjmcmc \
+            --num_threads {threads} \
+            -w {params.window} \
+            -l {input.lk} \
+            -p {input.pade} \
+            --snps_file {input.fasta} \
+            -b {params.block_penalty} \
+            --pos_file {input.pos} \
+            --burn_in {params.burn_in} \
+            -n {params.n_iter} \
+            -o {output.post}
+        """
+
+rule post_to_text:
+    input:
+        "10_ldhelmet/post/{chrom}.post"
+    output:
+        "10_ldhelmet/final/{chrom}.final.txt"
+    shell:
+        """
+        mkdir -p 10_ldhelmet/final
+        LDhelmet/ldhelmet post_to_text \
+            -m -p 0.025 -p 0.5 -p 0.975 \
+            -o {output} \
+            {input}
+        """
+
+rule convert_to_map:
+    input:
+        txt = "10_ldhelmet/final/{chrom}.final.txt"
+    output:
+        "10_ldhelmet/map/{chrom}.map"
+    params:
+        ne = 650000
+    shell:
+        """
+        mkdir -p 10_ldhelmet/map
+        python3 relatemap.py \
+            --input {input.txt} \
+            --output {output} \
+            --ne {params.ne}
+        """
+
+rule ldhelmet_all:
+    input:
+        expand("10_ldhelmet/map/{chrom}.map", chrom=LD_PHASE_CHROMS)
+
+
+rule make_haps_per_chrom:
+    input:
+        vcf = "06_phased/per_chrom/134inds_phased.{chrom}.vcf.gz"
+    output:
+        haps = "08_haps/per_chrom/{chrom}.haps",
+        sample = "08_haps/per_chrom/{chrom}.sample"
+    shell:
+        """
+        mkdir -p 08_haps/per_chrom
+        plink2 --vcf {input.vcf} --export haps --out 08_haps/per_chrom/{wildcards.chrom} --allow-extra-chr
+        """
+
+rule polarize_haps_per_chrom:
+    input:
+        est_sfs = expand("07_estsfs/{{chrom}}/estsfs_input_part{part}.txt", part=PARTS),
+        est_pvals = expand("07_estsfs/{{chrom}}/output/output-file-pvalues_part{part}.txt", part=PARTS),
+        hap = "08_haps/per_chrom/{chrom}.haps"
+    output:
+        polar = "08_haps/per_chrom/{chrom}_polarized.haps"
+    script:
+        "polar.py"
+
+rule concat_polarized_haps:
+    input:
+        expand("08_haps/per_chrom/{chrom}_polarized.haps", chrom=LD_PHASE_CHROMS)
+    output:
+        "08_haps/134inds_polarized.haps"
+    shell:
+        """
+        cat {input} > {output}
+        """
+
+rule copy_sample:
+    input:
+        "08_haps/per_chrom/" + LD_PHASE_CHROMS[0] + ".sample"
+    output:
+        "08_haps/134inds.sample"
+    shell:
+        """
+        cp {input} {output}
+        """
+
+rule polarize_all:
+    input:
+        "08_haps/134inds_polarized.haps",
+        "08_haps/134inds.sample"
+
+rule make_mask:
+    input:
+        REF_GENOME
+    output:
+        "reference/ref_genome_NP.fa"
+    shell:
+        """
+        (head -n 1 {input} && tail -n +2 {input} | sed 's/[ACGT]/P/g') > {output}
+        """
+
+rule relate_input:
+    input:
+        haps = "08_haps/134inds_polarized.haps",
+        sample = "08_haps/134inds.sample"
+    output:
+        haps = "09_relate/input/134inds.haps",
+        sample = "09_relate/input/134inds.sample"
+    shell:
+        """
+        mkdir -p 09_relate/input
+        cp {input.haps} {output.haps}
+        cp {input.sample} {output.sample}
+        """
+
+rule relate_haps_per_chrom:
+    input:
+        haps = "08_haps/134inds_polarized.haps"
+    output:
+        haps = "09_relate/per_chrom/{chrom}/134inds.haps"
+    shell:
+        """
+        mkdir -p 09_relate/per_chrom/{wildcards.chrom}
+        grep "^{wildcards.chrom} " {input.haps} > {output.haps}
+        """
+
+rule fix_sample_for_relate:
+    input:
+        "08_haps/per_chrom/{chrom}.sample"
+    output:
+        "09_relate/per_chrom/{chrom}/134inds.sample"
+    run:
+        with open(input[0]) as f:
+            lines = f.readlines()
+        
+        import os
+        os.makedirs(os.path.dirname(output[0]), exist_ok=True)
+        
+        with open(output[0], 'w') as out:
+            out.write("ID_1 ID_2 missing\n")
+            out.write("0 0 0\n")
+            for line in lines[2:]:
+                parts = line.strip().split()
+                sample_id = parts[1]
+                out.write(f"{sample_id} {sample_id} 0\n")
+
+rule hapmask:
+    input:
+        haps = "09_relate/per_chrom/{chrom}/134inds.haps",
+        sample = "09_relate/per_chrom/{chrom}/134inds.sample",
+        mask = "reference/ref_genome_NP.fa"
+    output:
+        haps = "09_relate/per_chrom/{chrom}/134inds_masked.haps",
+        dist = "09_relate/per_chrom/{chrom}/134inds_masked.dist"
+    params:
+        prefix_in = "09_relate/per_chrom/{chrom}/134inds",
+        prefix_out = "09_relate/per_chrom/{chrom}/134inds_masked"
+    shell:
+        """
+        relate/bin/RelateFileFormats \
+            --mode FilterHapsUsingMask \
+            --haps {input.haps} \
+            --sample {input.sample} \
+            --mask {input.mask} \
+            -o {params.prefix_out}
+        """
+
+rule relate:
+    input:
+        haps = "09_relate/per_chrom/{chrom}/134inds_masked.haps",
+        dist = "09_relate/per_chrom/{chrom}/134inds_masked.dist",
+        sample = "09_relate/per_chrom/{chrom}/134inds.sample",
+        map = "10_ldhelmet/map/{chrom}.map"
+    output:
+        anc = "09_relate/per_chrom/{chrom}/134inds.anc",
+        mut = "09_relate/per_chrom/{chrom}/134inds.mut"
+    params:
+        prefix = lambda wildcards: f"relate_{wildcards.chrom}",
+        ne = 650000,
+        mu = "3.18e-9"
+    threads: 1
+    shell:
+        """
+        WORKDIR=$(pwd)
+        TMPDIR="temp/relate_{wildcards.chrom}"
+        rm -rf $TMPDIR
+        mkdir -p $TMPDIR
+        cd $TMPDIR
+
+        $WORKDIR/relate/bin/Relate --mode All \
+            --haps $WORKDIR/{input.haps} \
+            --dist $WORKDIR/{input.dist} \
+            --map $WORKDIR/{input.map} \
+            --sample $WORKDIR/{input.sample} \
+            -N {params.ne} \
+            -m {params.mu} \
+            -o {params.prefix} \
+            --seed 1 \
+            --memory 5 || true
+
+        # Check that output files exist 
+        if [[ -f {params.prefix}.anc && -f {params.prefix}.mut ]]; then
+            mv {params.prefix}.anc $WORKDIR/09_relate/per_chrom/{wildcards.chrom}/134inds.anc
+            mv {params.prefix}.mut $WORKDIR/09_relate/per_chrom/{wildcards.chrom}/134inds.mut
+        else
+            echo "ERROR: Relate did not produce output files"
+            exit 1
+        fi
+
+        cd $WORKDIR
+        rm -rf $TMPDIR || true
+        """
+
+rule poplabels:
+    input:
+        sample = "09_relate/per_chrom/" + LD_PHASE_CHROMS[0] + "/134inds.sample",
+        poplist = POPLIST
+    output:
+        poplabels = "09_relate/poplabels.txt"
+    run:
+        pop_map = {}
+        with open(input.poplist) as f:
+            next(f)
+            for line in f:
+                parts = line.strip().split('\t')
+                if len(parts) >= 4:
+                    sample_id = parts[3]
+                    pop = parts[1]
+                    taxa = parts[2]
+                    pop_map[sample_id] = (pop, taxa)
+
+        with open(input.sample) as f, open(output.poplabels, 'w') as out:
+            out.write("sample population group sex\n")
+            next(f)  # skip header
+            next(f)  # skip dummy line
+            for line in f:
+                parts = line.strip().split()
+                sample = parts[0]
+                if sample in pop_map:
+                    pop, taxa = pop_map[sample]
+                    # assign group based on taxa
+                    if taxa == "C.corone":
+                        group = "corone"
+                    elif taxa == "C.cornix":
+                        group = "cornix"
+                    elif taxa == "C.orientalis":
+                        group = "orientalis"
+                    elif taxa == "C.pallescens":
+                        group = "pallescens"
+                    elif taxa == "C.capellanus":
+                        group = "capellanus"
+                    elif taxa == "Hybrid":
+                        group = "hybrid"
+                    else:
+                        group = taxa.replace("C.", "").lower()
+                    out.write(f"{sample}_1 {pop} {group} 1\n")
+                    out.write(f"{sample}_2 {pop} {group} 1\n")
+
+rule estimate_popsize:
+    input:
+        anc = "09_relate/per_chrom/{chrom}/134inds.anc",
+        mut = "09_relate/per_chrom/{chrom}/134inds.mut",
+        poplabels = "09_relate/poplabels.txt"
+    output:
+        coal = "09_relate/popsize/{chrom}/134inds.coal"
+    params:
+        prefix_in = "09_relate/per_chrom/{chrom}/134inds",
+        prefix_out = "09_relate/popsize/{chrom}/134inds",
+        mu = "3.18e-9",
+        gen = 5.79
+    threads: 8
+    shell:
+        """
+        mkdir -p 09_relate/popsize/{wildcards.chrom}
+        relate/scripts/EstimatePopulationSize/EstimatePopulationSize.sh \
+            -i {params.prefix_in} \
+            --poplabels {input.poplabels} \
+            --years_per_gen {params.gen} \
+            --seed 1 \
+            --num_iter 10 \
+            --threshold 0.5 \
+            --threads {threads} \
+            -m {params.mu} \
+            -o {params.prefix_out} || true
+        
+        # check coal file was created
+        test -f {output.coal}
+        """
+
+rule treeseq:
+    input:
+        anc = "09_relate/popsize/{chrom}/134inds.anc.gz",
+        mut = "09_relate/popsize/{chrom}/134inds.mut.gz"
+    output:
+        "09_relate/trees/{chrom}/134inds.trees"
+    params:
+        prefix_in = "09_relate/popsize/{chrom}/134inds",
+        prefix_out = "09_relate/trees/{chrom}/134inds"
+    threads: 10
+    shell:
+        """
+        mkdir -p 09_relate/trees/{wildcards.chrom}
+        relate/bin/RelateFileFormats \
+            --mode ConvertToTreeSequence \
+            -i {params.prefix_in} \
+            -o {params.prefix_out}
+        """
+
+checkpoint get_bps:
+    input:
+        anc = "09_relate/popsize/{chrom}/134inds.anc.gz",
+        mut = "09_relate/popsize/{chrom}/134inds.mut.gz"
+    output:
+        bps = "09_relate/bps/{chrom}_bps.txt"
+    params:
+        TREESKIP = 1000
+    run:
+        import gzip
+        print(f"getting tree indices for {wildcards.chrom}")
+        ixs_start = []
+        ixs_end = []
+        trees = []
+        with gzip.open(input.anc, "rt") as f:
+            for i, line in enumerate(f):
+                if i == 1:
+                    n = int(line.split()[1])
+                    trees = [x for x in range(0, n+1, int(params.TREESKIP))]
+                if i > 1 and (i-2) in trees:
+                    ixs_start.append(int(line.split(':')[0]))
+                if i > 2 and (i-3) in trees:
+                    ixs_end.append(int(line.split(':')[0]) - 1)
+        print(f"chose {len(ixs_start)} trees")
+        
+        bps_start = []
+        bps_end = []
+        with gzip.open(input.mut, "rt") as f:
+            for i, line in enumerate(f):
+                if i > 0 and int(line.split(';')[0]) in ixs_start:
+                    bps_start.append(int(line.split(';')[1]))
+                if i > 0 and int(line.split(';')[0]) in ixs_end:
+                    bps_end.append(int(line.split(';')[1]))
+        
+        import os
+        os.makedirs(os.path.dirname(output.bps), exist_ok=True)
+        with open(output.bps, "w") as out:
+            for start, end in zip(bps_start, bps_end):
+                out.write(f"{start} {end}\n")
+
+def get_bps_intervals(wildcards):
+    bps_file = checkpoints.get_bps.get(chrom=wildcards.chrom).output.bps
+    intervals = []
+    with open(bps_file) as f:
+        for line in f:
+            start, stop = line.strip().split()
+            intervals.append((start, stop))
+    return intervals
+
+def all_newick_files(wildcards):
+    files = []
+    for chrom in LD_PHASE_CHROMS:
+        bps_file = checkpoints.get_bps.get(chrom=chrom).output.bps
+        with open(bps_file) as f:
+            for line in f:
+                start, stop = line.strip().split()
+                files.append(f"09_relate/trees2/{chrom}_{start}-{stop}.newick")
+    return files
+
+rule sample_tree:
+    input:
+        anc = "09_relate/popsize/{chrom}/134inds.anc.gz",
+        mut = "09_relate/popsize/{chrom}/134inds.mut.gz",
+        dist = "09_relate/popsize/{chrom}/134inds.dist",
+        coal = "09_relate/popsize/{chrom}/134inds.coal"
+    output:
+        newick = "09_relate/trees2/{chrom}_{start}-{stop}.newick"
+    params:
+        prefix_in = "09_relate/popsize/{chrom}/134inds",
+        prefix_out = "09_relate/trees2/{chrom}_{start}-{stop}",
+        mu = "3.18e-9"
+    threads: 1
+    shell:
+        """
+        mkdir -p 09_relate/trees2
+        relate/scripts/SampleBranchLengths/SampleBranchLengths.sh \
+            -i {params.prefix_in} \
+            --dist {input.dist} \
+            --coal {input.coal} \
+            -o {params.prefix_out} \
+            -m {params.mu} \
+            --format n \
+            --num_samples 100 \
+            --first_bp {wildcards.start} \
+            --last_bp {wildcards.stop} \
+            --seed 1
+        """
+
+rule sample_trees_all:
+    input:
+        all_newick_files,
+        expand("09_relate/trees/{chrom}/134inds.trees", chrom=LD_PHASE_CHROMS)
+
+
+# ============== SPACETREES ANALYSIS ==============
+
+TREESKIP = 1000  # sample every 1000th tree
+NUM_SAMPLES = 100  # number of branch length samples per tree
+
+# shared times and coalescence times
+rule time2:
+    input:
+        newick = "09_relate/trees2/{chrom}_{start}-{stop}.newick"
+    output:
+        stss = "09_relate/trees2/{chrom}_{start}-{stop}._sts.npy",
+        ctss = "09_relate/trees2/{chrom}_{start}-{stop}._cts.npy"
+    threads: 1
+    run:
+        from tsconvert.newick import from_newick
+        from utils import get_shared_times
+        import numpy as np
+        from tqdm import tqdm
+
+        stss = []
+        ctss = []
+        with open(input.newick, mode='r') as f:
+            next(f)  # skip header
+            for line in tqdm(f, total=NUM_SAMPLES):
+                string = line.split()[4]
+                ts = from_newick(string, min_edge_length=1e-6)
+                tree = ts.first()
+
+                samples = [int(ts.node(node).metadata['name']) for node in ts.samples()]
+                sample_order = np.argsort(samples)
+                ordered_samples = [ts.samples()[i] for i in sample_order]
+                sts = get_shared_times(tree, ordered_samples)
+                stss.append(sts)
+
+                cts = sorted([tree.time(i) for i in tree.nodes() if not tree.is_sample(i)])
+                ctss.append(cts)
+
+        np.save(output.stss, np.array(stss))
+        np.save(output.ctss, np.array(ctss))
+
+
+# process shared times
+rule process_shared_times:
+    input:
+        stss = "09_relate/trees2/{chrom}_{start}-{stop}._sts.npy"
+    output:
+        mc_invs = "09_relate/trees2/{chrom}_{start}-{stop}_NoneT_mc-invs.npy",
+        logdets = "09_relate/trees2/{chrom}_{start}-{stop}_NoneT_logdets.npy",
+        samples = "09_relate/trees2/{chrom}_{start}-{stop}_NoneT_samples.npy"
+    threads: 1
+    run:
+        import os
+        os.environ["OMP_NUM_THREADS"] = str(threads)
+
+        import numpy as np
+        from utils import chop_shared_times, center_shared_times
+
+        stss = np.load(input.stss)
+        
+        stss_inv = []
+        stss_logdet = []
+        smplsss = []
+        tCutoff = None
+        
+        for sts in stss:
+            sts_chopped, smpls = chop_shared_times(sts, tCutoff=tCutoff)
+            sts_inv = []
+            sts_logdet = []
+            smplss = []
+            
+            for st, sm in zip(sts_chopped, smpls):
+                stc = center_shared_times(st)
+                stc_inv = np.linalg.pinv(stc)
+                stc_logdet = np.linalg.slogdet(st)[1]
+                sts_inv.append(stc_inv)
+                sts_logdet.append(stc_logdet)
+                smplss.append(sm)
+            
+            stss_inv.append(sts_inv)
+            stss_logdet.append(sts_logdet)
+            smplsss.append(smplss)
+        
+        np.save(output.mc_invs, np.array(stss_inv, dtype=object))
+        np.save(output.logdets, np.array(stss_logdet, dtype=object))
+        np.save(output.samples, np.array(smplsss, dtype=object))
+
+# process coalescence times
+rule process_coal_times:
+    input:
+        ctss = "09_relate/trees2/{chrom}_{start}-{stop}._cts.npy",
+        coal = "09_relate/popsize/{chrom}/134inds.coal"
+    output:
+        bts = "09_relate/trees2/{chrom}_{start}-{stop}_NoneT_bts.npy",
+        lpcs = "09_relate/trees2/{chrom}_{start}-{stop}_NoneT_lpcs.npy"
+    threads: 1
+    run:
+        import os
+        os.environ["OMP_NUM_THREADS"] = str(threads)
+
+        import numpy as np
+        from spacetrees import _log_coal_density
+
+        epochs = np.genfromtxt(input.coal, skip_header=1, skip_footer=1)
+        Nes = 0.5 / np.genfromtxt(input.coal, skip_header=2)[2:]
+
+        ctss = np.load(input.ctss)
+        btss = []
+        lpcs = []
+        tCutoff = None
+
+        for cts in ctss:
+            cts = np.array(cts)
+            T = cts[-1] if len(cts) > 0 else 0
+            if tCutoff is not None and tCutoff < T:
+                T = tCutoff
+            bts = T - np.flip(cts)
+            bts = bts[bts > 0]
+            bts = np.append(bts, T)
+            btss.append(bts)
+
+            lpc = _log_coal_density(times=cts, Nes=Nes, epochs=epochs, tCutoff=tCutoff)
+            lpcs.append(lpc)
+
+        np.save(output.bts, np.array(btss, dtype=object))
+        np.save(output.lpcs, np.array(lpcs, dtype=object))
+
+# helper functions for checkpoints
+def get_all_processed_files(wildcards, suffix):
+    files = []
+    for chrom in LD_PHASE_CHROMS:
+        bps_file = checkpoints.get_bps.get(chrom=chrom).output.bps
+        with open(bps_file) as f:
+            for line in f:
+                start, stop = line.strip().split()
+                files.append(f"09_relate/trees2/{chrom}_{start}-{stop}_NoneT_{suffix}.npy")
+    return files
+
+def all_mc_invs(wildcards):
+    return get_all_processed_files(wildcards, "mc-invs")
+
+def all_logdets(wildcards):
+    return get_all_processed_files(wildcards, "logdets")
+
+def all_samples(wildcards):
+    return get_all_processed_files(wildcards, "samples")
+
+def all_bts(wildcards):
+    return get_all_processed_files(wildcards, "bts")
+
+def all_lpcs(wildcards):
+    return get_all_processed_files(wildcards, "lpcs")
+
+def all_stss(wildcards):
+    files = []
+    for chrom in LD_PHASE_CHROMS:
+        bps_file = checkpoints.get_bps.get(chrom=chrom).output.bps
+        with open(bps_file) as f:
+            for line in f:
+                start, stop = line.strip().split()
+                files.append(f"09_relate/trees2/{chrom}_{start}-{stop}._sts.npy")
+    return files
+
+rule process_all:
+    input:
+        all_mc_invs,
+        all_logdets,
+        all_samples,
+        all_bts,
+        all_lpcs
+
+# estimate dispersal rate
+rule dispersal_rate:
+    input:
+        stss_mc_inv = all_mc_invs,
+        stss_logdet = all_logdets,
+        btss = all_bts,
+        lpcss = all_lpcs,
+        locs = "09_relate/locs/locations.npy"
+    output:
+        sigma = "09_relate/trees2/NoneT_mle-dispersal.sigma"
+    threads: 1
+    run:
+        import os
+        os.environ["OMP_NUM_THREADS"] = str(threads)
+        os.environ["GOTO_NUM_THREADS"] = str(threads)
+        os.environ["OPENBLAS_NUM_THREADS"] = str(threads)
+        os.environ["MKL_NUM_THREADS"] = str(threads)
+        import numpy as np
+        from tqdm import tqdm
+        from spacetrees import estimate_dispersal
+
+        locations = np.load(input.locs)
+        locations = np.repeat(locations, 2, axis=0)  # 134 diploid → 268 haploid
+
+        step = 2
+        mc_inv_files = list(input.stss_mc_inv)[::step]
+        logdet_files = list(input.stss_logdet)[::step]
+        bts_files = list(input.btss)[::step]
+        lpcs_files = list(input.lpcss)[::step]
+        print(f"using {len(mc_inv_files)} of {len(input.stss_mc_inv)} files")
+
+        stss_mc_inv = []
+        for f in tqdm(mc_inv_files):
+            stss_mc_inv.append(np.load(f, allow_pickle=True))
+        stss_logdet = []
+        for f in tqdm(logdet_files):
+            stss_logdet.append(np.load(f, allow_pickle=True))
+        btss = []
+        for f in tqdm(bts_files):
+            btss.append(np.load(f, allow_pickle=True))
+        lpcss = []
+        for f in tqdm(lpcs_files):
+            lpcss.append(np.load(f, allow_pickle=True))
+
+        def callbackF(x):
+            print('{0: 3.6f}   {1: 3.6f}   {2: 3.6f}   {3: 3.6f}'.format(x[0], x[1], x[2], x[3]))
+
+        sigma = estimate_dispersal(
+            locations=locations,
+            shared_times_inverted=stss_mc_inv,
+            shared_times_logdet=stss_logdet,
+            branching_times=btss,
+            logpcoals=lpcss,
+            callbackF=callbackF
+        )
+
+        with open(output.sigma, 'w') as f:
+            f.write(','.join([str(i) for i in sigma]))
+
+# locate ancestors for each sample
+rule locate_ancestor:
+    input:
+        stss = "09_relate/trees2/{chrom}_{start}-{stop}._sts.npy",
+        locs = "09_relate/locs/locations.npy",
+        mle = "09_relate/trees2/NoneT_mle-dispersal.npy",
+        btss = "09_relate/trees2/{chrom}_{start}-{stop}_NoneT_bts.npy",
+        lpcs = "09_relate/trees2/{chrom}_{start}-{stop}_NoneT_lpcs.npy"
+    output:
+        ancloc = "09_relate/ancloc/{chrom}_{start}-{stop}_NoneT_{sample}sample.npy"
+    threads: 1
+    run:
+        import os
+        os.environ["OMP_NUM_THREADS"] = str(threads)
+
+        import numpy as np
+        from spacetrees import _sds_rho_to_sigma, _log_birth_density, locate_ancestors
+        from utils import chop_shared_times
+
+        locations = np.load(input.locs)
+        locations = np.repeat(locations, 2, axis=0)
+        n = len(locations)
+
+        ancestor_samples = [int(wildcards.sample)]
+        tCutoff = None
+
+        times1 = np.logspace(1, np.log10(1e4), 10)
+        times2 = np.logspace(np.log10(1e4), np.log10(1e5), 5)[1:3]
+        ancestor_times = np.concatenate([times1, times2])
+
+        stss_chopped = []
+        samples = []
+        for sts in np.load(input.stss):
+            sts_chopped, smpls = chop_shared_times(sts, tCutoff=None)
+            stss_chopped.append(sts_chopped)
+            samples.append(smpls)
+
+        mle = np.load(input.mle)
+        sigma = _sds_rho_to_sigma(mle[0:3])
+
+        btss = np.load(input.btss, allow_pickle=True)
+        phi = mle[-1]
+        lbds = np.array([_log_birth_density(bts, phi, n) for bts in btss])
+        lpcs = np.load(input.lpcs, allow_pickle=True)
+        log_weights = lbds - lpcs
+
+        ancestor_locations = locate_ancestors(
+            ancestor_samples,
+            ancestor_times,
+            stss_chopped,
+            samples,
+            locations,
+            log_weights,
+            sigma
+        )
+        np.save(output.ancloc, ancestor_locations)
+
+# get all ancestor locations
+def all_ancloc_files(wildcards):
+    files = []
+    for chrom in LD_PHASE_CHROMS:
+        bps_file = checkpoints.get_bps.get(chrom=chrom).output.bps
+        with open(bps_file) as f:
+            for line in f:
+                start, stop = line.strip().split()
+                for sample in range(268):  # 134 individuals * 2 haplotypes
+                    files.append(f"09_relate/ancloc/{chrom}_{start}-{stop}_NoneT_{sample}sample.npy")
+    return files
+
+rule locate_ancestors_all:
+    input:
+        all_ancloc_files
+
+rule spacetrees_all:
+    input:
+        "09_relate/trees2/NoneT_mle-dispersal.npy"
+
+BLUP_SAMPLES = list(range(268))
+LOCATIONS = "09_relate/locs/locations.npy"
+
+import numpy as np
+ANCESTOR_TIMES = list(np.concatenate([
+    np.logspace(1, np.log10(1e4), 10),
+    np.logspace(np.log10(1e4), np.log10(1e5), 5)[1:3]
+]))
+
+def all_blup_files(wildcards):
+    files = []
+    for chrom in LD_PHASE_CHROMS:
+        bps_file = checkpoints.get_bps.get(chrom=chrom).output.bps
+        with open(bps_file) as f:
+            for line in f:
+                start, stop = line.strip().split()
+                files.append(f"09_relate/blup/{chrom}_{start}-{stop}_anc-locs_blup.npy")
+    return files
+
+rule blup_locate_ancestor_locus:
+    input:
+        stss_raw = "09_relate/trees2/{chrom}_{start}-{stop}._sts.npy",
+        mc_invs = "09_relate/trees2/{chrom}_{start}-{stop}_NoneT_mc-invs.npy",
+        locs = LOCATIONS
+    output:
+        "09_relate/blup/{chrom}_{start}-{stop}_anc-locs_blup.npy"
+    threads: 1
+    resources:
+        mem_mb = 8000
+    run:
+        import os
+        os.environ["OMP_NUM_THREADS"] = str(threads)
+        os.environ["OPENBLAS_NUM_THREADS"] = str(threads)
+        os.environ["MKL_NUM_THREADS"] = str(threads)
+        os.environ["NUMEXPR_NUM_THREADS"] = str(threads)
+        
+        import numpy as np
+        from spacetrees import locate_ancestors
+        
+        locations = np.load(input.locs)
+        locations = np.repeat(locations, 2, axis=0)
+        n_samples = len(locations)
+        
+        ancestor_samples = list(range(n_samples))
+        ancestor_times = np.logspace(1,np.log10(5e6),30)
+        
+        raw_trees = np.load(input.stss_raw)
+        inv_trees = np.load(input.mc_invs, allow_pickle=True)
+        
+        stss_flat = []
+        mc_invs_flat = []
+        
+        for sts, inv_list in zip(raw_trees, inv_trees):
+            stss_flat.append(np.array(sts, dtype=np.float64))
+            
+            if isinstance(inv_list, list) and len(inv_list) == 1:
+                mc_invs_flat.append(np.array(inv_list[0], dtype=np.float64))
+            elif isinstance(inv_list, np.ndarray) and inv_list.ndim == 2:
+                mc_invs_flat.append(np.array(inv_list, dtype=np.float64))
+            else:
+                mc_invs_flat.append(np.array(inv_list[0], dtype=np.float64))
+        
+        log_weights = np.zeros(len(stss_flat))
+        
+        ancestor_locations = locate_ancestors(
+            samples=ancestor_samples,
+            times=ancestor_times,
+            shared_times_chopped=stss_flat,
+            shared_times_chopped_centered_inverted=mc_invs_flat,
+            locations=locations,
+            log_weights=log_weights,
+            BLUP=True,
+            BLUP_var=True,
+            quiet=True
+        )
+        
+        os.makedirs(os.path.dirname(output[0]), exist_ok=True)
+        np.save(output[0], np.array(ancestor_locations))
+
+
+def all_blup_files_chr18(wildcards):
+    files = []
+    chrom = 'NC_046347.1'  # chr18 only
+    bps_file = checkpoints.get_bps.get(chrom=chrom).output.bps
+    with open(bps_file) as f:
+        for line in f:
+            start, stop = line.strip().split()
+            files.append(f"09_relate/blup/{chrom}_{start}-{stop}_anc-locs_blup.npy")
+    return files
+
+rule blup_high_fst:
+    input:
+        "09_relate/blup/NC_046347.1_9912028-9912051_anc-locs_blup.npy"
+
+def all_blup_files(wildcards):
+    files = []
+    for chrom in LD_PHASE_CHROMS:
+        bps_file = checkpoints.get_bps.get(chrom=chrom).output.bps
+        with open(bps_file) as f:
+            for line in f:
+                start, stop = line.strip().split()
+                files.append(f"09_relate/blup/{chrom}_{start}-{stop}_anc-locs_blup.npy")
+    return files
+
+
+rule blup_all:
+    input:
+        all_blup_files
